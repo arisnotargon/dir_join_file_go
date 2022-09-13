@@ -1,1 +1,1 @@
-a go version of [dir_join_file] (https://github.com/arisnotargon/dir_join_file)
+a go version of [dir_join_file](https://github.com/arisnotargon/dir_join_file)
