@@ -1,3 +1,5 @@
+// @Description append a folder to the end of a specified file,with gzip compressed and aes crypto
+// @Auth https://github.com/arisnotargon
 package dirjoinfilego
 
 import (
@@ -10,10 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 // pack up a directory as a tar buffer,then crypto this buffer and append it to the end of a specified file
@@ -38,11 +37,33 @@ type DirJionFile struct {
 
 	// iv for aes crypto
 	Iv []byte
+
+	FileOffset int64
 }
 
 // return n int the length of original source file,err error
-func (d *DirJionFile) Join() (n int, err error) {
-	spew.Dump("start==============")
+func (d *DirJionFile) Join() (n int64, err error) {
+	// check target directoy exist
+	stat, err := os.Stat(d.TargetDirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = os.MkdirAll(d.TargetDirPath, os.ModePerm)
+			if err != nil {
+				return
+			}
+		} else if os.IsPermission(err) {
+			err = errors.New("target path permision error")
+			return
+		} else {
+			return
+		}
+	}
+
+	if !stat.IsDir() {
+		err = errors.New("target path is not a directory")
+		return
+	}
+
 	sourceReader, err := os.Open(d.SourceFilePath)
 
 	if err != nil {
@@ -60,7 +81,7 @@ func (d *DirJionFile) Join() (n int, err error) {
 	outFile, _ := os.Create(d.OutPutFilePath)
 	defer outFile.Close()
 
-	n, err = outFile.Write(p)
+	_, err = outFile.Write(p)
 	if err != nil {
 		return
 	}
@@ -81,10 +102,100 @@ func (d *DirJionFile) Join() (n int, err error) {
 
 	// crypto
 	data, err := d.bufCrypto()
-	spew.Dump("data,err := d.bufCrypto()===>", data, err)
 
+	n = int64(len(data))
 	// d.buf.WriteTo(outFile)
 	outFile.Write(data)
+
+	return
+}
+
+func (d *DirJionFile) Restore() (err error) {
+	// check output path exist
+	outPathStat, err := os.Stat(d.OutPutFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = os.MkdirAll(d.OutPutFilePath, os.ModePerm)
+			if err != nil {
+				return
+			}
+			outPathStat, err = os.Stat(d.OutPutFilePath)
+		} else if os.IsPermission(err) {
+			err = errors.New("out put path permision error")
+			return
+		} else {
+			return
+		}
+	}
+
+	if !outPathStat.IsDir() {
+		err = errors.New("out put path is not a directory")
+		return
+	}
+
+	// read joined file with offset
+	sourceFile, err := os.Open(d.SourceFilePath)
+	if err != nil {
+		return
+	}
+	defer sourceFile.Close()
+
+	sourceFile.Seek(-d.FileOffset, io.SeekEnd)
+
+	sourceData, err := io.ReadAll(sourceFile)
+
+	// decrypto
+	originData, err := d.bufDecrypto(&sourceData)
+	if err != nil {
+		return
+	}
+
+	sourceBufer := bytes.NewBuffer(originData)
+
+	gzipReader, err := gzip.NewReader(sourceBufer)
+	if err != nil {
+		return
+	}
+	defer gzipReader.Close()
+	tarReader := tar.NewReader(gzipReader)
+
+Loop:
+	for {
+		header, err := tarReader.Next()
+		switch {
+		case err == io.EOF:
+			break Loop
+		case err != nil:
+			return err
+		case header == nil:
+			continue
+		}
+		targetPath := filepath.Join(d.OutPutFilePath, header.Name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			info, err := os.Stat(targetPath)
+			dirExist := (err == nil || os.IsExist(err)) && info.IsDir()
+			if !dirExist {
+				err = os.MkdirAll(targetPath, os.ModePerm)
+				if err != nil {
+					return err
+				}
+			}
+
+		case tar.TypeReg:
+			file, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(file, tarReader)
+			if err2 := file.Close(); err2 != nil {
+				return err2
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
 
 	return
 }
@@ -115,24 +226,25 @@ func (d *DirJionFile) doTar(fileName string, fileInfo os.FileInfo, err error) (r
 
 	fileReader, reErr := os.Open(fileName)
 	defer func(fileReader *os.File) {
-		err := fileReader.Close()
-		spew.Dump("fileReader close err===>", err)
+		err1 := fileReader.Close()
+		if err1 != nil {
+			reErr = err1
+		}
 	}(fileReader)
 
 	if reErr != nil {
 		return
 	}
 
-	n, reErr := io.Copy(d.tarWriter, fileReader)
+	_, reErr = io.Copy(d.tarWriter, fileReader)
 	if reErr != nil {
 		return
 	}
 
-	spew.Dump(fileName + "====> has been written to tar,len" + strconv.Itoa(int(n)))
-
 	return
 }
 
+// bufCrypto aes crypto
 func (d *DirJionFile) bufCrypto() (reData []byte, err error) {
 	d.initPassWord()
 	err = d.initIv(aes.BlockSize)
@@ -151,6 +263,24 @@ func (d *DirJionFile) bufCrypto() (reData []byte, err error) {
 	reData = make([]byte, len(plaintext))
 
 	blockMode.CryptBlocks(reData, plaintext)
+
+	return
+}
+
+func (d *DirJionFile) bufDecrypto(ciphertext *[]byte) (reData []byte, err error) {
+	d.initPassWord()
+	err = d.initIv(aes.BlockSize)
+	if err != nil {
+		return
+	}
+	block, err := aes.NewCipher(d.passWordBytes)
+	if err != nil {
+		return
+	}
+	blockMode := cipher.NewCBCDecrypter(block, d.Iv)
+	reData = make([]byte, len(*ciphertext))
+	blockMode.CryptBlocks(reData, *ciphertext)
+	reData = pkcs7UnPadding(reData)
 
 	return
 }
@@ -194,4 +324,10 @@ func pkcs7Padding(ciphertext []byte, blockSize int) []byte {
 	padding := blockSize - len(ciphertext)%blockSize
 	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
 	return append(ciphertext, padtext...)
+}
+
+func pkcs7UnPadding(origData []byte) []byte {
+	length := len(origData)
+	unpadding := int(origData[length-1])
+	return origData[:(length - unpadding)]
 }
