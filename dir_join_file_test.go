@@ -18,6 +18,9 @@ func TestDirJoin(t *testing.T) {
 		OutPutFilePath: prefix + "out.mp4",
 	}
 	n, err := djf.Join()
+	if err != nil {
+		t.Fail()
+	}
 	globalOffset = n
 
 	spew.Config.Dump("n=====>>>>", n, err)
@@ -32,6 +35,10 @@ func TestRestore(t *testing.T) {
 		FileOffset:     globalOffset, // FileOffset must be set as the same as the first return value of dirjoinfilego.DirJionFile.Join()
 	}
 	err := djf.Restore()
+
+	if err != nil {
+		t.Fail()
+	}
 
 	spew.Dump("restore error====>>>", err)
 }
